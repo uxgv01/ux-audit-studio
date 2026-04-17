@@ -805,7 +805,7 @@ async function runAIAudit(screenName, imageBase64) {
   messages[0].content.push({ type: "text", text: prompt });
 
   try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const response = await fetch("/api/audit", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 8000, messages }),
