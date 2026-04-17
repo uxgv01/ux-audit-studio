@@ -57,37 +57,65 @@ export default async function handler(req, res) {
     payload.systemInstruction = { parts: [{ text: String(body.systemInstruction) }] };
   }
 
-  try {
-    const upstream = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
-      {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const maxAttempts = 4;
+  let lastStatus = 0, lastRaw = "";
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const upstream = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
+      });
+
+      const raw = await upstream.text();
+      lastStatus = upstream.status;
+      lastRaw = raw;
+
+      if (upstream.ok) {
+        let data;
+        try { data = JSON.parse(raw); } catch { return res.status(502).json({ error: "Upstream returned non-JSON", raw: raw.slice(0, 500) }); }
+        const text = (data.candidates || [])
+          .flatMap((c) => (c.content?.parts || []).map((p) => p.text || ""))
+          .join("");
+        return res.status(200).json({
+          content: [{ type: "text", text }],
+          _provider: "gemini",
+          _model: model,
+          _attempts: attempt,
+        });
       }
-    );
 
-    const raw = await upstream.text();
-    if (!upstream.ok) {
-      res.status(upstream.status);
-      res.setHeader("Content-Type", "application/json");
-      return res.send(raw);
+      // Retry on transient errors
+      const retriable = upstream.status === 503 || upstream.status === 429 || upstream.status === 500;
+      if (!retriable || attempt === maxAttempts) {
+        res.status(upstream.status);
+        res.setHeader("Content-Type", "application/json");
+        return res.send(raw);
+      }
+
+      // Backoff: parse retryDelay hint if present, else exponential with jitter
+      let delayMs = Math.min(8000, 600 * Math.pow(2, attempt - 1)) + Math.random() * 300;
+      try {
+        const parsed = JSON.parse(raw);
+        const hint = parsed?.error?.details?.find?.((d) => d["@type"]?.includes("RetryInfo"))?.retryDelay;
+        if (hint) {
+          const sec = parseFloat(String(hint).replace("s", ""));
+          if (!isNaN(sec) && sec > 0) delayMs = Math.min(12000, sec * 1000 + 200);
+        }
+      } catch {}
+      await new Promise((r) => setTimeout(r, delayMs));
+    } catch (err) {
+      if (attempt === maxAttempts) {
+        return res.status(502).json({ error: "Upstream fetch failed", detail: String(err?.message || err) });
+      }
+      await new Promise((r) => setTimeout(r, 600 * Math.pow(2, attempt - 1)));
     }
-
-    let data;
-    try { data = JSON.parse(raw); } catch { return res.status(502).json({ error: "Upstream returned non-JSON", raw: raw.slice(0, 500) }); }
-
-    // Extract text and normalize to Anthropic-like shape { content: [{type:"text", text}] }
-    const text = (data.candidates || [])
-      .flatMap((c) => (c.content?.parts || []).map((p) => p.text || ""))
-      .join("");
-
-    return res.status(200).json({
-      content: [{ type: "text", text }],
-      _provider: "gemini",
-      _model: model,
-    });
-  } catch (err) {
-    return res.status(502).json({ error: "Upstream fetch failed", detail: String(err?.message || err) });
   }
+
+  // Should not reach; safety net
+  res.status(lastStatus || 502);
+  res.setHeader("Content-Type", "application/json");
+  return res.send(lastRaw || JSON.stringify({ error: "Exhausted retries" }));
 }
