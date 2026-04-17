@@ -42,7 +42,7 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "messages[] required" });
   }
 
-  const model = body.geminiModel || "gemini-2.5-flash";
+  const model = body.geminiModel || "gemini-2.5-pro";
   const contents = toGeminiContents(body.messages);
 
   const payload = {
@@ -50,8 +50,12 @@ export default async function handler(req, res) {
     generationConfig: {
       maxOutputTokens: body.max_tokens || 8000,
       responseMimeType: "application/json",
+      temperature: typeof body.temperature === "number" ? body.temperature : 0.2,
     },
   };
+  if (body.systemInstruction) {
+    payload.systemInstruction = { parts: [{ text: String(body.systemInstruction) }] };
+  }
 
   try {
     const upstream = await fetch(

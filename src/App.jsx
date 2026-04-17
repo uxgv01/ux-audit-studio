@@ -674,28 +674,35 @@ function buildAllPolicyItems() {
   ];
 }
 
-function buildAuditPrompt(screenName, allItems, dsRules) {
-  const policyList = allItems.map(r => `${r.id}|${r.msg}`).join("\n");
-  const dsList = dsRules.map(r => `${r.id}|${r.rule}`).join("\n");
+function buildBatchPrompt(screenName, batchName, items, includeAnalysis) {
+  const list = items.map(r => `${r.id}|${r.msg}`).join("\n");
+  const analysisLine = includeAnalysis
+    ? `First, identify screen PURPOSE (p), TARGET USER (u), KEY FEATURES (f), CONTENT TYPE (t).\n\n`
+    : "";
+  const schemaSample = includeAnalysis
+    ? `{"a":{"p":"목적","u":"사용자","f":["기능1","기능2"],"t":"유형"},"r":[{"id":"ID","v":"p|f|s","m":"근거"}]}`
+    : `{"r":[{"id":"ID","v":"p|f|s","m":"근거"}]}`;
 
-  return `You are a UX/UI audit engine. Analyze the uploaded screen image and evaluate each checklist item.
+  return `You are a senior UX/UI auditor evaluating the uploaded screen image. Domain: ${batchName}.
 
-Screen: ${screenName}
+Screen name: ${screenName}
 
-Instructions:
-1. Identify the screen's PURPOSE, TARGET USER, KEY FEATURES, CONTENT TYPE.
-2. For each item below, judge p(pass)/f(fail)/s(skip) based on what you SEE in the image.
-3. Use "s" for items that cannot be judged from a static image.
-4. Keep reason under 15 Korean characters.
+${analysisLine}For each ${batchName} item, judge:
+- "p" (pass): clearly satisfied by what is observable in the image
+- "f" (fail): clearly violated by what is observable in the image
+- "s" (skip): CANNOT be determined from a static image alone
 
-Policy (${allItems.length}):
-${policyList}
+CRITICAL RULES:
+1. Default to "s" whenever evidence is ambiguous, hidden, or requires interaction/data you cannot see.
+2. Items about dynamic behavior (autosave, loading, hover/pressed states, cross-device sync, A/B defaults, auto-fill) → ALWAYS "s".
+3. Only return "p" or "f" when the image shows direct, unambiguous evidence.
+4. "m" (reason): under 20 Korean characters, cite the visible evidence (or lack of it).
 
-DS (${dsRules.length}):
-${dsList}
+Items (${items.length}):
+${list}
 
 Respond with ONLY valid JSON, no markdown, no backticks:
-{"a":{"p":"목적","u":"사용자","f":["기능"],"t":"유형"},"r":[{"id":"ID","v":"p","m":"근거"}]}`;
+${schemaSample}`;
 }
 
 function scoreFromAIResults(aiResults) {
@@ -790,13 +797,28 @@ function scoreFromAIResults(aiResults) {
   };
 }
 
-async function runAIAudit(screenName, imageBase64) {
-  const allItems = buildAllPolicyItems();
-  const dsAutoRules = DS_RULES.filter(r => r.auto);
-  const prompt = buildAuditPrompt(screenName, allItems, dsAutoRules);
+function parseJsonLoose(rawText) {
+  let jsonStr = (rawText || "").replace(/```json/g, "").replace(/```/g, "").trim();
+  try { return JSON.parse(jsonStr); } catch {}
+  const s = jsonStr.indexOf("{");
+  const e2 = jsonStr.lastIndexOf("}");
+  if (s >= 0 && e2 > s) {
+    const sub = jsonStr.substring(s, e2 + 1);
+    try { return JSON.parse(sub); } catch {}
+    // try repairing truncation by balancing brackets
+    const ob = (sub.match(/{/g)||[]).length - (sub.match(/}/g)||[]).length;
+    const oa = (sub.match(/\[/g)||[]).length - (sub.match(/\]/g)||[]).length;
+    let fix = sub;
+    for (let i = 0; i < oa; i++) fix += "]";
+    for (let i = 0; i < ob; i++) fix += "}";
+    try { return JSON.parse(fix); } catch {}
+  }
+  return null;
+}
 
+async function callAuditBatch(screenName, imageBase64, batch) {
+  const prompt = buildBatchPrompt(screenName, batch.name, batch.items, batch.includeAnalysis);
   const messages = [{ role: "user", content: [] }];
-
   if (imageBase64) {
     const mediaType = imageBase64.startsWith("data:image/png") ? "image/png" : "image/jpeg";
     const base64Data = imageBase64.split(",")[1];
@@ -804,70 +826,71 @@ async function runAIAudit(screenName, imageBase64) {
   }
   messages[0].content.push({ type: "text", text: prompt });
 
-  try {
-    const response = await fetch("/api/audit", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 8000, messages }),
-    });
+  const response = await fetch("/api/audit", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      messages,
+      max_tokens: 4000,
+      temperature: 0.2,
+    }),
+  });
 
-    if (!response.ok) {
-      const errBody = await response.text().catch(() => "");
-      throw new Error("API " + response.status + ": " + errBody.substring(0, 200));
-    }
+  if (!response.ok) {
+    const errBody = await response.text().catch(() => "");
+    throw new Error(batch.name + " API " + response.status + ": " + errBody.substring(0, 200));
+  }
 
-    const data = await response.json();
-    const rawText = (data.content || []).map(function(c) { return c.text || ""; }).join("");
+  const data = await response.json();
+  const rawText = (data.content || []).map(c => c.text || "").join("");
+  if (!rawText || rawText.length < 5) {
+    throw new Error(batch.name + ": 빈 응답");
+  }
 
-    if (!rawText || rawText.length < 10) {
-      throw new Error("AI 응답이 비어 있습니다. 이미지를 업로드 후 다시 시도해 주세요.");
-    }
+  const parsed = parseJsonLoose(rawText);
+  if (!parsed) throw new Error(batch.name + ": JSON 파싱 실패");
 
-    var parsed = null;
-    var jsonStr = rawText.replace(/```json/g, "").replace(/```/g, "").trim();
-
-    try { parsed = JSON.parse(jsonStr); } catch(e) {
-      var s = jsonStr.indexOf("{");
-      var e2 = jsonStr.lastIndexOf("}");
-      if (s >= 0 && e2 > s) {
-        var sub = jsonStr.substring(s, e2 + 1);
-        try { parsed = JSON.parse(sub); } catch(e3) {
-          var ob = (sub.match(/{/g)||[]).length - (sub.match(/}/g)||[]).length;
-          var oa = (sub.match(/\[/g)||[]).length - (sub.match(/\]/g)||[]).length;
-          var fix = sub;
-          for (var i=0;i<oa;i++) fix += "]";
-          for (var i=0;i<ob;i++) fix += "}";
-          try { parsed = JSON.parse(fix); } catch(e4) { /* give up */ }
-        }
-      }
-    }
-
-    if (!parsed) {
-      throw new Error("AI 응답 파싱 실패. 다시 시도해 주세요.");
-    }
-
-    var aiResults = (parsed.r || parsed.results || []).map(function(r) {
-      var v = r.v || r.verdict || "s";
-      return {
-        id: r.id,
-        verdict: v === "p" ? "pass" : v === "f" ? "fail" : v === "s" ? "skip" : v,
-        reason: r.m || r.reason || "",
-      };
-    });
-
-    var analysis = parsed.a || parsed.screen_analysis || {};
-    var screenAnalysis = {
-      purpose: analysis.p || analysis.purpose || "",
-      target_user: analysis.u || analysis.target_user || "",
-      key_features: analysis.f || analysis.key_features || [],
-      content_type: analysis.t || analysis.content_type || "",
+  const aiResults = (parsed.r || parsed.results || []).map(r => {
+    const v = r.v || r.verdict || "s";
+    return {
+      id: r.id,
+      verdict: v === "p" ? "pass" : v === "f" ? "fail" : v === "s" ? "skip" : v,
+      reason: r.m || r.reason || "",
     };
+  });
 
-    var result = scoreFromAIResults(aiResults);
+  let screenAnalysis = null;
+  if (parsed.a || parsed.screen_analysis) {
+    const a = parsed.a || parsed.screen_analysis;
+    screenAnalysis = {
+      purpose: a.p || a.purpose || "",
+      target_user: a.u || a.target_user || "",
+      key_features: a.f || a.key_features || [],
+      content_type: a.t || a.content_type || "",
+    };
+  }
+
+  return { aiResults, screenAnalysis };
+}
+
+async function runAIAudit(screenName, imageBase64) {
+  const batches = [
+    { name: "UX Policy", items: QA_RULES.map(r => ({ id: r.id, msg: r.rule })), includeAnalysis: true },
+    { name: "UX Checklist", items: UX_CHECKLIST.map(r => ({ id: r.id, msg: r.q })), includeAnalysis: false },
+    { name: "UI Checklist", items: UI_CHECKLIST.map(r => ({ id: r.id, msg: r.q })), includeAnalysis: false },
+    { name: "DS Rules", items: DS_RULES.filter(r => r.auto).map(r => ({ id: r.id, msg: r.rule })), includeAnalysis: false },
+  ];
+
+  try {
+    const batchResults = await Promise.all(batches.map(b => callAuditBatch(screenName, imageBase64, b)));
+    const allAiResults = batchResults.flatMap(r => r.aiResults);
+    const screenAnalysis = batchResults.find(r => r.screenAnalysis)?.screenAnalysis || {
+      purpose: "", target_user: "", key_features: [], content_type: "",
+    };
+    const result = scoreFromAIResults(allAiResults);
     result.screenAnalysis = screenAnalysis;
     result.timestamp = new Date().toLocaleString("ko-KR");
     return result;
-
   } catch (err) {
     console.error("AI Audit error:", err);
     return {
