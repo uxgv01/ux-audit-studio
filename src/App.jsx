@@ -873,7 +873,7 @@ async function callAuditBatch(screenName, imageBase64, batch) {
   return { aiResults, screenAnalysis };
 }
 
-async function runAIAudit(screenName, imageBase64) {
+async function runAIAudit(screenName, imageBase64, onProgress) {
   const batches = [
     { name: "UX Policy", items: QA_RULES.map(r => ({ id: r.id, msg: r.rule })), includeAnalysis: true },
     { name: "UX Checklist", items: UX_CHECKLIST.map(r => ({ id: r.id, msg: r.q })), includeAnalysis: false },
@@ -882,7 +882,16 @@ async function runAIAudit(screenName, imageBase64) {
   ];
 
   try {
-    const batchResults = await Promise.all(batches.map(b => callAuditBatch(screenName, imageBase64, b)));
+    const batchResults = [];
+    for (let i = 0; i < batches.length; i++) {
+      const b = batches[i];
+      if (onProgress) onProgress(`(${i + 1}/${batches.length}) ${b.name} 검수 중...`);
+      batchResults.push(await callAuditBatch(screenName, imageBase64, b));
+      // Small delay between sequential calls to stay under free-tier RPM
+      if (i < batches.length - 1) {
+        await new Promise(r => setTimeout(r, 1500));
+      }
+    }
     const allAiResults = batchResults.flatMap(r => r.aiResults);
     const screenAnalysis = batchResults.find(r => r.screenAnalysis)?.screenAnalysis || {
       purpose: "", target_user: "", key_features: [], content_type: "",
@@ -1149,15 +1158,10 @@ function AuditPage({ archive, onAddResult, onNav }) {
   const doAudit = async () => {
     const name = screenName || "화면 검수";
     setLoading(true); setError(null);
-
-    const msgs = ["화면 콘텐츠 분석 중...", "화면 목적과 구조 파악 중...", "UX Policy 검수 중...", "UI 체크리스트 검증 중...", "DS 규칙 확인 중...", "점수 산출 중..."];
-    let mi = 0;
-    setLoadingMsg(msgs[0]);
-    const interval = setInterval(() => { mi = Math.min(mi + 1, msgs.length - 1); setLoadingMsg(msgs[mi]); }, 3000);
+    setLoadingMsg("화면 분석 준비 중...");
 
     try {
-      const res = await runAIAudit(name, imageForApi || null);
-      clearInterval(interval);
+      const res = await runAIAudit(name, imageForApi || null, (msg) => setLoadingMsg(msg));
 
       if (res.error) {
         setError(res.error);
@@ -1170,7 +1174,6 @@ function AuditPage({ archive, onAddResult, onNav }) {
       onAddResult(res);
       setPopupResult(res);
     } catch (err) {
-      clearInterval(interval);
       setError("AI 분석 중 오류가 발생했습니다: " + err.message);
     }
     setLoading(false);
