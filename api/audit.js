@@ -42,7 +42,7 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "messages[] required" });
   }
 
-  const model = body.geminiModel || "gemini-2.0-flash";
+  const model = body.geminiModel || "gemini-2.5-flash";
   const contents = toGeminiContents(body.messages);
 
   const payload = {
